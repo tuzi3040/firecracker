@@ -9,31 +9,35 @@ use std::{mem, result};
 
 use gdt;
 use kvm;
-use kvm_sys::kvm_fpu;
-use kvm_sys::kvm_msr_entry;
-use kvm_sys::kvm_msrs;
-use kvm_sys::kvm_regs;
-use kvm_sys::kvm_sregs;
+use kvm_gen::kvm_fpu;
+use kvm_gen::kvm_msr_entry;
+use kvm_gen::kvm_msrs;
+use kvm_gen::kvm_regs;
+use kvm_gen::kvm_sregs;
 use layout;
 use memory_model::{GuestAddress, GuestMemory};
 use sys_util;
 
 #[derive(Debug)]
 pub enum Error {
-    /// Failed to configure the FPU.
-    ConfigureFPU(sys_util::Error),
+    /// Failed to get SREGs for this CPU.
+    GetStatusRegisters(sys_util::Error),
     /// Failed to set base registers for this CPU.
-    ConfigureBaseRegisters(sys_util::Error),
+    SetBaseRegisters(sys_util::Error),
+    /// Failed to configure the FPU.
+    SetFPURegisters(sys_util::Error),
     /// Setting up MSRs failed.
-    ConfigureMSRs(sys_util::Error),
+    SetModelSpecificRegisters(sys_util::Error),
     /// Failed to set SREGs for this CPU.
-    ConfigureSREGs(sys_util::Error),
+    SetStatusRegisters(sys_util::Error),
     /// Writing the GDT to RAM failed.
     WriteGDT,
     /// Writing the IDT to RAM failed.
     WriteIDT,
     /// Writing PDPTE to RAM failed.
     WritePDPTEAddress,
+    /// Writing PDE to RAM failed.
+    WritePDEAddress,
     /// Writing PML4 to RAM failed.
     WritePML4Address,
 }
@@ -52,7 +56,7 @@ pub fn setup_fpu(vcpu: &kvm::VcpuFd) -> Result<()> {
         ..Default::default()
     };
 
-    vcpu.set_fpu(&fpu).map_err(Error::ConfigureFPU)
+    vcpu.set_fpu(&fpu).map_err(Error::SetFPURegisters)
 }
 
 /// Configure Model Specific Registers (MSRs) for a given CPU.
@@ -79,7 +83,8 @@ pub fn setup_msrs(vcpu: &kvm::VcpuFd) -> Result<()> {
     }
     msrs.nmsrs = entry_vec.len() as u32;
 
-    vcpu.set_msrs(msrs).map_err(Error::ConfigureMSRs)
+    vcpu.set_msrs(msrs)
+        .map_err(Error::SetModelSpecificRegisters)
 }
 
 /// Configure base registers for a given CPU.
@@ -100,7 +105,7 @@ pub fn setup_regs(vcpu: &kvm::VcpuFd, boot_ip: u64, boot_sp: u64, boot_si: u64) 
         ..Default::default()
     };
 
-    vcpu.set_regs(&regs).map_err(Error::ConfigureBaseRegisters)
+    vcpu.set_regs(&regs).map_err(Error::SetBaseRegisters)
 }
 
 /// Configures the segment registers and system page tables for a given CPU.
@@ -110,12 +115,12 @@ pub fn setup_regs(vcpu: &kvm::VcpuFd, boot_ip: u64, boot_sp: u64, boot_si: u64) 
 /// * `mem` - The memory that will be passed to the guest.
 /// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
 pub fn setup_sregs(mem: &GuestMemory, vcpu: &kvm::VcpuFd) -> Result<()> {
-    let mut sregs: kvm_sregs = vcpu.get_sregs().map_err(Error::ConfigureSREGs)?;
+    let mut sregs: kvm_sregs = vcpu.get_sregs().map_err(Error::GetStatusRegisters)?;
 
     configure_segments_and_sregs(mem, &mut sregs)?;
     setup_page_tables(mem, &mut sregs)?; // TODO(dgreid) - Can this be done once per system instead?
 
-    vcpu.set_sregs(&sregs).map_err(Error::ConfigureSREGs)
+    vcpu.set_sregs(&sregs).map_err(Error::SetStatusRegisters)
 }
 
 const BOOT_GDT_OFFSET: usize = 0x500;
@@ -190,11 +195,25 @@ fn setup_page_tables(mem: &GuestMemory, sregs: &mut kvm_sregs) -> Result<()> {
     // Puts PML4 right after zero page but aligned to 4k.
     let boot_pml4_addr = GuestAddress(layout::PML4_START);
     let boot_pdpte_addr = GuestAddress(layout::PDPTE_START);
+    let boot_pde_addr = GuestAddress(layout::PDE_START);
 
+    // Entry covering VA [0..512GB)
     mem.write_obj_at_addr(boot_pdpte_addr.offset() as u64 | 0x03, boot_pml4_addr)
         .map_err(|_| Error::WritePML4Address)?;
-    mem.write_obj_at_addr(0x83u64, boot_pdpte_addr)
+
+    // Entry covering VA [0..1GB)
+    mem.write_obj_at_addr(boot_pde_addr.offset() as u64 | 0x03, boot_pdpte_addr)
         .map_err(|_| Error::WritePDPTEAddress)?;
+    // 512 2MB entries together covering VA [0..1GB). Note we are assuming
+    // CPU supports 2MB pages (/proc/cpuinfo has 'pse'). All modern CPUs do.
+    for i in 0..512 {
+        mem.write_obj_at_addr(
+            (i << 21) + 0x83u64,
+            boot_pde_addr.unchecked_add((i * 8) as usize),
+        )
+        .map_err(|_| Error::WritePDEAddress)?;
+    }
+
     sregs.cr3 = boot_pml4_addr.offset() as u64;
     sregs.cr4 |= X86_CR4_PAE;
     sregs.cr0 |= X86_CR0_PG;
@@ -307,7 +326,13 @@ mod tests {
         setup_page_tables(&gm, &mut sregs).unwrap();
 
         assert_eq!(0xa003, read_u64(&gm, layout::PML4_START));
-        assert_eq!(0x83, read_u64(&gm, layout::PDPTE_START));
+        assert_eq!(0xb003, read_u64(&gm, layout::PDPTE_START));
+        for i in 0..512 {
+            assert_eq!(
+                (i << 21) + 0x83u64,
+                read_u64(&gm, layout::PDE_START + (i * 8) as usize)
+            );
+        }
 
         assert_eq!(layout::PML4_START as u64, sregs.cr3);
         assert_eq!(X86_CR4_PAE, sregs.cr4);
@@ -397,7 +422,8 @@ mod tests {
             expected_regs.rip,
             expected_regs.rsp,
             expected_regs.rsi,
-        ).unwrap();
+        )
+        .unwrap();
 
         let actual_regs: kvm_regs = vcpu.get_regs().unwrap();
         assert_eq!(actual_regs, expected_regs);
